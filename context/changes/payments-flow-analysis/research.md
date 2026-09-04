@@ -38,7 +38,7 @@ To potwierdza mapę repozytorium: największe ryzyko leży na granicach `classes
 
 Bootstrap ładuje warstwy płatnicze w `paid-memberships-pro.php:30-179`, a `includes/init.php:60-102` kieruje żądania stron PMPro do właściwych preheaderów. Checkout tworzy i wzbogaca `MemberOrder` (`preheaders/checkout.php:586-620`), wywołuje gateway (`preheaders/checkout.php:624-656`, `classes/class.memberorder.php:1636-1641`), a po sukcesie finalizuje członkostwo i zapis zamówienia (`includes/checkout.php:220-347`).
 
-Stripe ma dwa synchroniczne warianty: bezpośredni PaymentIntent/charge oraz Stripe Checkout z późniejszą finalizacją przez webhook (`classes/gateways/class.pmprogateway_stripe.php:2220-2326`). Webhook jest rejestrowany jako WordPress AJAX endpoint (`includes/services.php:38-44`), potwierdza request przed dalszym przetwarzaniem (`services/class-pmpro-stripe-webhook-handler.php:128-131`), opcjonalnie kolejkuje zdarzenie przez Action Scheduler (`:149-185`) i routuje typ zdarzenia (`:206-236`).
+Stripe ma dwa warianty checkoutu: bezpośredni PaymentIntent/charge oraz Stripe Checkout z asynchroniczną finalizacją przez webhook (`classes/gateways/class.pmprogateway_stripe.php:2220-2326`). Webhook jest rejestrowany jako WordPress AJAX endpoint (`includes/services.php:38-44`), potwierdza request przed dalszym przetwarzaniem (`services/class-pmpro-stripe-webhook-handler.php:128-131`), opcjonalnie kolejkuje zdarzenie przez Action Scheduler (`:149-185`) i routuje typ zdarzenia (`:206-236`).
 
 W repozytorium nie znaleziono testów własnych dla tej ścieżki: brak katalogu `tests`, PHPUnit, Playwright, Cypress, Jest lub analogicznego oraz brak skryptu testowego w `package.json:10-25`. Wszystkie zidentyfikowane gałęzie checkoutu, webhooków, duplikatów i błędów są więc obecnie niepokryte testami repozytorium.
 
@@ -87,7 +87,26 @@ Wspólna warstwa płatności cyklicznych znajduje się w `includes/gateway-reque
 
 Istotna granica: zwykła ścieżka aktualizacji danych billingowych nie wywołuje jawnie `saveOrder()`; dla tymczasowego orderu preheader wyraźnie zakłada brak zapisu (`preheaders/billing.php:43-54`).
 
-### 5. Diagram przepływu
+### 5. Weryfikacja twierdzeń strukturalnych przez ast-grep
+
+Poniższe wyniki dotyczą wzorców AST uruchomionych na kodzie PHP repozytorium. Liczności oznaczają dopasowania składni wywołania, nie dowodzą częstotliwości wykonania w runtime.
+
+| Twierdzenie z raportu | Wzorzec ast-grep i wynik | Ocena | Dowód |
+|---|---|---|---|
+| Checkout wywołuje gatewayowe `process()`, a `MemberOrder` deleguje do gatewaya. | `$OBJ->process($$$)` → 2 dopasowania: preheader checkoutu i delegacja w `MemberOrder`; `function process($$$)` potwierdza implementacje gatewayów. | **potwierdzone** | `preheaders/checkout.php:629`; `classes/class.memberorder.php:1639`; kontrakt `classes/gateways/class.pmprogateway.php:16` i implementacje m.in. `classes/gateways/class.pmprogateway_stripe.php:2220`, `classes/gateways/class.pmprogateway_braintree.php:551`. |
+| `pmpro_complete_async_checkout()` prowadzi do tej samej finalizacji co checkout synchroniczny. | `pmpro_complete_async_checkout($$$)` → 1 dopasowanie; definicja zwraca `pmpro_complete_checkout($order)`. | **potwierdzone** | `services/class-pmpro-stripe-webhook-handler.php:891`; `includes/checkout.php:358-359`. |
+| `pmpro_complete_checkout()` jest wspólnym punktem finalizacji. | `pmpro_complete_checkout($$$)` → 2 dopasowania: zwykły preheader i wrapper async; definicja zawiera zapis orderu. | **potwierdzone** | `preheaders/checkout.php:679`; `includes/checkout.php:220`, `includes/checkout.php:301`, `includes/checkout.php:359`. |
+| Zapis orderu jest elementem jednej ścieżki checkoutu / jest lokalizowany przy finalizacji checkoutu. | `$OBJ->saveOrder($$$)` → 27 dopasowań w produkcyjnym PHP, w tym webhooki wielu gatewayów, handlery cykliczne, admin i upgrade. | **obalone** | Przykłady poza checkoutem: `services/braintree-webhook.php:170`, `services/authnet-silent-post.php:150`, `includes/gateway-request-handlers.php:201`, `services/class-pmpro-stripe-webhook-handler.php:601`, `adminpages/orders.php:63`. Checkout ma dopasowania `includes/checkout.php:207`, `includes/checkout.php:301`. |
+| Zwykła aktualizacja billingowa nie wywołuje jawnie `saveOrder()`. | `$OBJ->updateBilling($$$)` → 2 dopasowania; brak `saveOrder()` w `preheaders/billing.php`, ale istnieje osobna ścieżka webhooka Braintree. | **doprecyzowane** | `preheaders/billing.php:258` nie ma lokalnego zapisu; `services/braintree-webhook.php:465` wywołuje `updateBilling()`. Twierdzenie jest prawdziwe tylko dla orkiestracji billing preheadera, nie dla całego repozytorium. |
+| Istnieją dwa synchroniczne warianty Stripe: direct i Stripe Checkout. | `function process($$$)` dla Stripe → `classes/gateways/class.pmprogateway_stripe.php:2220`; wzorzec async → `pmpro_complete_async_checkout($$$)` w handlerze webhooka. | **doprecyzowane** | Są dwa warianty checkoutu, ale Stripe Checkout jest wariantem asynchronicznej finalizacji: redirect `classes/gateways/class.pmprogateway_stripe.php:2220-2227`, webhook `services/class-pmpro-stripe-webhook-handler.php:891`, wspólna finalizacja `includes/checkout.php:358-359`. |
+| Sukces i błąd płatności cyklicznej przechodzą przez współdzielone handlery. | Wzorce `pmpro_handle_recurring_payment_succeeded_at_gateway($$$)` i `...failure...($$$)` dają po 2 dopasowaniach: IPN i Stripe webhook. | **potwierdzone** | Sukces: `services/ipnhandler.php:709`, `services/class-pmpro-stripe-webhook-handler.php:267`; błąd: `services/ipnhandler.php:681`, `services/class-pmpro-stripe-webhook-handler.php:382`. |
+| Stripe webhook ma jeden publiczny AJAX endpoint dostępny dla zalogowanych i niezalogowanych. | Wzorce `add_action(...)` dla `wp_ajax_nopriv_stripe_webhook` i `wp_ajax_stripe_webhook` → po jednym hooku każdego typu, oba wskazują tę samą funkcję. | **potwierdzone** | `includes/services.php:38-44`. |
+| Kontrakt gatewaya obejmuje pojedynczy wspólny kształt metod `process()` i `cancel()`. | `function process($$$)` oraz `function cancel($$$)` pokazują bazowy kontrakt i wiele implementacji; sygnatury nie są całkowicie jednolite (np. Stripe ma dodatkowy parametr w `cancel`). | **doprecyzowane** | Bazowe metody: `classes/gateways/class.pmprogateway.php:16`, `classes/gateways/class.pmprogateway.php:110`; Stripe: `classes/gateways/class.pmprogateway_stripe.php:2220`, `classes/gateways/class.pmprogateway_stripe.php:2580`; inne implementacje np. `classes/gateways/class.pmprogateway_check.php:313`, `:443`. |
+| Schemat trwałości jest utrzymywany przez `dbDelta()`, z wieloma definicjami tabel. | `dbDelta($$$)` → 16 dopasowań łącznie; 15 w `includes/upgradecheck.php` i 1 w dołączonym Action Scheduler. | **potwierdzone** | `includes/upgradecheck.php:523-807`; dodatkowe dopasowanie `includes/lib/action-scheduler/classes/abstracts/ActionScheduler_Abstract_Schema.php:143`. |
+
+Wzorce nie potwierdzają twierdzeń o zachowaniu runtime, kolejności hooków, liczbie wykonań ani kompletności testów. Dla tych tez raport pozostawia wnioski oparte na odrębnych dowodach statycznych lub oznacza krawędzie WordPress/runtime jako `unknown`.
+
+### 6. Diagram przepływu
 
 ```mermaid
 flowchart TD
