@@ -12,9 +12,9 @@ The scope is deliberately limited to checkout finalization. Billing-update orche
 - Preserve existing statuses, order fields, hooks, emails, return values, and ordering unless a test demonstrates a defect.
 - Use one explicit finalization service/contract with contextual sync or async entry data.
 - Keep `pmpro_complete_checkout()` and `pmpro_complete_async_checkout()` as deprecated wrappers during migration.
-- Normalize failures into an explicit result contract where safe; if characterization exposes behavior that depends on existing retry or failure semantics, preserve that behavior instead.
+- Use normalized outcomes only as an internal, behavior-preserving representation; public wrappers and direct/webhook adapters retain current return values, response semantics, and retry behavior.
 - Do not change schema, transaction identifiers, lookup rules, or upgrade behavior.
-- Provide a feature-flagged rollout and an operational rollback path to the current implementation.
+- Preserve the current implementation as an internal legacy path, then provide a feature-flagged rollout and operational rollback path.
 
 ## Current state
 
@@ -34,11 +34,11 @@ Direct and asynchronous checkout enter a named, testable finalization contract. 
 
 #### Changes Required:
 
-- `tests/` and test configuration — Add the smallest supported WordPress integration harness, isolated database setup, plugin bootstrap, and deterministic order/member fixtures. The harness must run in CI/local development without real payment-provider calls.
+- `tests/` and test configuration — Add a PHPUnit-compatible WordPress integration harness using the repository’s supported PHP 7.4+ target, a documented supported WordPress test version, and an isolated MySQL-compatible test database. Include plugin bootstrap, deterministic order/member fixtures, per-test reset/cleanup, and one documented command such as `composer test`. The harness must run in CI/local development without real payment-provider calls.
 - `tests/checkout/` — Characterize direct completion for success, already-completed/duplicate order, membership-change failure, persistence failure, hook ordering, email dispatch, and returned values.
 - `tests/stripe/` — Characterize the webhook completion seam with a verified event fixture, missing transaction-ID recovery, duplicate delivery, advisory-lock/status gating, and Action Scheduler handoff boundaries. Keep endpoint registration and signature verification in scope for integration coverage, but stub external Stripe retrieval.
 - `tests/contract/` — Record the observable contract for order fields, membership status, subscription creation/loading, actions/filters, and notification behavior.
-- `composer.json`, test configuration, and CI workflow — Add only the dependencies and commands needed for the harness; keep the existing PHP 7.4 compatibility target.
+- `composer.json`, test configuration, and CI workflow — Add only the PHPUnit/WordPress test dependencies, bootstrap configuration, database environment variables, and `composer test` command needed for the harness; keep the existing PHP 7.4 compatibility target. Broader PHP/WordPress matrix expansion is not required in this change.
 
 **Contract:** Tests must fail if the refactor changes externally observable completion behavior, including hook/email ordering and retry-sensitive outcomes. Provider HTTP calls and real payment mutations are never made by automated tests.
 
@@ -56,15 +56,15 @@ Direct and asynchronous checkout enter a named, testable finalization contract. 
 
 #### Changes Required:
 
-- `includes/checkout.php` or a focused new PHP service file — Extract the shared mutation into one explicit finalization operation that accepts an order plus source/context data. Keep responsibilities for membership change, order persistence, subscription effects, hooks, emails, and return semantics equivalent to the characterized behavior.
+- `includes/checkout.php` or a focused new PHP service file — First preserve the current function body as a named internal legacy implementation, then extract the shared mutation into one explicit finalization operation that accepts an order plus source/context data. Keep responsibilities for membership change, order persistence, subscription effects, hooks, emails, and return semantics equivalent to the characterized behavior.
 - `includes/checkout.php` — Reduce `pmpro_complete_checkout()` and `pmpro_complete_async_checkout()` to compatibility wrappers delegating to the new boundary. Preserve their signatures and argument behavior.
 - `services/class-pmpro-stripe-webhook-handler.php` — Adapt async completion to pass explicit webhook context without moving signature verification, event routing, locking, or queue behavior into the new service.
 - `preheaders/checkout.php` — Adapt direct completion to pass explicit direct-checkout context while preserving redirect timing and preheader behavior.
 - Deprecation location and release metadata — Use the project’s established WordPress deprecation mechanism if one is confirmed during implementation; otherwise add a narrowly scoped developer/debug-only deprecation signal with documented version and migration text. Do not emit production-visible warnings that can corrupt AJAX/webhook responses.
 
-**Contract:** The new operation is the only implementation of shared finalization. Legacy functions remain callable, delegate transparently, and do not independently mutate membership or orders.
+**Contract:** The new operation is the only implementation used by the new path. Any normalized outcome is internal. Public wrappers and direct/webhook adapters preserve current return values and response semantics. A separate internal legacy implementation remains intact for feature-flag rollback. Legacy public functions remain callable and delegate through the dispatcher without independently mutating membership or orders.
 
-**Critical Implementation Details:** Do not move advisory locks, duplicate/status gates, transaction-ID recovery, Action Scheduler behavior, or event acknowledgement into a generic service unless the characterization tests prove equivalent ordering and retry behavior. The service must not introduce a second `saveOrder()` or membership mutation.
+**Critical Implementation Details:** Do not move advisory locks, duplicate/status gates, transaction-ID recovery, Action Scheduler behavior, or event acknowledgement into a generic service unless the characterization tests prove equivalent ordering and retry behavior. The service must not introduce a second `saveOrder()` or membership mutation. Normalized internal outcomes must be translated back to the existing public return and webhook response semantics.
 
 #### Success Criteria:
 
@@ -80,12 +80,12 @@ Direct and asynchronous checkout enter a named, testable finalization contract. 
 
 #### Changes Required:
 
-- Feature-flag configuration and the finalization dispatcher — Add a narrowly scoped, default-off or compatibility-safe flag with a documented filter/configuration override. The dispatcher must select the new boundary or the legacy implementation without executing both.
+- Feature-flag configuration and the finalization dispatcher — Add the exact `pmpro_use_checkout_finalization_boundary` boolean filter, defaulting to `false` so the preserved legacy implementation remains the safe default. The filter is the sole override mechanism, is evaluated before any finalization side effect, and the dispatcher selects the new boundary only when it returns `true`.
 - `preheaders/checkout.php` and `services/class-pmpro-stripe-webhook-handler.php` — Migrate direct and Stripe async internal callers one at a time, keeping the legacy path available through the flag.
 - Test fixtures — Add matrix coverage for flag enabled/disabled, direct/async source context, duplicate delivery, missing IDs, and failure/retry outcomes.
 - Documentation/changelog — Document activation, observed signals, rollback, deprecation timeline, and the fact that the flag changes orchestration only, not payment-provider or schema behavior.
 
-**Contract:** The flag is evaluated before any finalization side effect; exactly one implementation runs per request. Disabling it restores the pre-refactor finalization path without data migration or cleanup.
+**Contract:** `pmpro_use_checkout_finalization_boundary` defaults to `false`; a WordPress filter callback may return `true` for staged activation. Exactly one implementation runs per request. `false` selects the preserved legacy implementation without data migration or cleanup. Legacy removal is a later change, not part of this rollout.
 
 #### Success Criteria:
 
