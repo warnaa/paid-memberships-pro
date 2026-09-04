@@ -5,10 +5,11 @@ git_commit: fe3d25a85dfacf40d3788d386a88d308f2cade7a
 branch: 10xdevs-m4
 repository: paid-memberships-pro
 topic: "Ocena możliwości refaktoryzacji wynikających z analizy przepływu płatności"
-tags: [research, codebase, refactor, payments, stripe, architecture]
+tags: [research, codebase, refactor, payments, stripe, architecture, verified]
 status: complete
 last_updated: 2026-09-04
 last_updated_by: Codex
+verification_commit: 3b3833472622dee78806b2e9de944dcf01316b66
 ---
 
 # Research: Możliwości refaktoryzacji
@@ -75,6 +76,27 @@ Raport `context/changes/payments-flow-analysis/research.md` oraz `context/map/re
 **Intencjonalność.** Historia zawiera konkretne poprawki brakującego subscription ID i defensywnego odzyskiwania (`eb27eb3b6`, `241912546`) — **evidence**. Nie znaleziono ADR-u definiującego kanoniczną tożsamość płatności — **unknown**. Werdykt: rozróżnienie payment/subscription jest prawdopodobnie świadomym modelem integracji, ale to, czy należy je zunifikować, jest pytaniem biznesowo-domenowym — **unknown**.
 
 **Wykonalność.** Nie rekomenduję refaktoru pojęć bez osobnej analizy domenowej. Bezpieczny prerekwizyt to inventory wszystkich lookupów i fixture zdarzeń Stripe/IPN, a nie zmiana nazw pól. Jeśli analiza potwierdzi stabilny model, pierwszy kodowy krok może dodać jawny adapter identyfikatorów bez zmiany schematu. Blast radius obejmuje webhooki, subskrypcje, refundy, cancellation, admin i migracje — **evidence** z raportu.
+
+## Weryfikacja twierdzeń (ast-grep)
+
+Weryfikacja dotyczy strukturalnych twierdzeń, na których opiera się ranking. Liczby są liczbą dopasowań składniowych w aktualnym checkoutcie, nie liczbą wykonań runtime. Każde `AST_ZERO` zostało dodatkowo sprawdzone klasycznym `rg`; zero oznacza więc brak dopasowania do konkretnego wzorca AST, a nie automatycznie brak kodu.
+
+| Twierdzenie | Werdykt | Dowód (plik:linia) | Metoda (wzorzec/reguła) |
+|---|---|---|---|
+| `pmpro_complete_checkout()` jest jednym wspólnym punktem dla direct i async completion. | **potwierdzone** | Wywołania: `preheaders/checkout.php:679`, `includes/checkout.php:359`; definicja i zapis: `includes/checkout.php:220-301`. | AST `$F($$$)` zawężony nazwą `pmpro_complete_checkout` → 2 call-site’y; AST definicji funkcji → 1 definicja. |
+| `pmpro_complete_async_checkout()` jest cienkim wrapperem do `pmpro_complete_checkout()`. | **potwierdzone** | `services/class-pmpro-stripe-webhook-handler.php:891`; wrapper `includes/checkout.php:358-359`. | AST `pmpro_complete_async_checkout($$$)` → 1; AST `function pmpro_complete_async_checkout($$$) { $$$ }` → 1 definicja. |
+| `updateBilling()` ma dwa produkcyjne call-site’y, w preheaderze i Braintree webhooku. | **potwierdzone** | `preheaders/billing.php:258`; `services/braintree-webhook.php:465`. | AST `$OBJ->updateBilling($$$)` → 2. |
+| `saveOrder()` jest rozproszone poza checkoutem, a nie ograniczone do jednego punktu. | **potwierdzone** | 27 dopasowań, m.in. `includes/checkout.php:207`, `includes/checkout.php:301`, `services/class-pmpro-stripe-webhook-handler.php:601`, `:636`, `:896`, `adminpages/orders.php:63`, `services/braintree-webhook.php:170`. | AST `$OBJ->saveOrder($$$)` → 27; wynik obejmuje checkout, webhooki, handlery, admin i upgrade. |
+| Schemat ma 15 wywołań `dbDelta()` w `upgradecheck.php`. | **potwierdzone** | `includes/upgradecheck.php:523,576,588,600,629,646,666,681,695,723,737,751,764,777,807`. | AST `dbDelta($$$)` z globem `includes/upgradecheck.php` → 15. |
+| `MemberOrder` ma dwa osobne lookupi: payment transaction i subscription transaction. | **doprecyzowane** | Deklaracje: `classes/class.memberorder.php:1059`, `:1076`; payment lookupi: `services/class-pmpro-stripe-webhook-handler.php:410`, `:425`; subscription lookup: `:676` (przez `PMPro_Subscription`) oraz `classes/class.memberorder.php:1737`. | AST `$OBJ->getMemberOrderByPaymentTransactionID($$$)` → 4 call-site’y w repo; AST `$OBJ->getLastMemberOrderBySubscriptionTransactionID($$$)` → 12 call-site’ów. Odrębne metody są potwierdzone, ale nie każdy subscription lookup jest w tej samej klasie. |
+| Stripe checkout jest dopasowywany przez order meta, refund przez payment transaction ID, a subskrypcja przez subscription transaction ID. | **potwierdzone** | Order meta SQL: `services/class-pmpro-stripe-webhook-handler.php:500`, `:623`; refund: `:410`, `:425`; subskrypcja: `:676`. | AST `$wpdb->get_var($$$)` → dopasowania SQL w handlerze; AST metod lookupów → odpowiednie call-site’y; literalne wartości `stripe_checkout_session_id` i pól ID potwierdzone `rg`. |
+| Webhook Stripe ma parę lustrzanych hooków priv/nopriv kierujących do tej samej funkcji. | **potwierdzone po kontroli klasycznej** | `includes/services.php:43-44` — `wp_ajax_nopriv_stripe_webhook` i `wp_ajax_stripe_webhook`. | AST `add_action($HOOK, $CALLBACK)` → `AST_ZERO` (zbyt ogólny placeholder dla tego parsera); `rg` literalnych hooków → dokładnie 2 wpisy, oba `pmpro_wp_ajax_stripe_webhook`. |
+| Istnieje wspólny kontrakt `process()` gatewayów, ale implementacje mają wiele klas. | **potwierdzone** | Bazowy kontrakt `classes/gateways/class.pmprogateway.php:16`; Stripe `classes/gateways/class.pmprogateway_stripe.php:2220`; Braintree `classes/gateways/class.pmprogateway_braintree.php:551`; checkout call-site `preheaders/checkout.php:629`. | AST `$OBJ->process($$$)` → 2 call-site’y; AST wzorca deklaracji funkcji nie daje stabilnego agregatu przez różnice składni, a `rg` deklaracji `function process` potwierdza bazę i wiele implementacji. |
+| `cancel()` ma jeden identyczny kształt sygnatury we wszystkich gatewayach. | **obalone** | Bazowy `classes/gateways/class.pmprogateway.php:110`; Stripe `classes/gateways/class.pmprogateway_stripe.php:2580` ma dodatkowy `$update_status`; inne implementacje `classes/gateways/class.pmprogateway_check.php:443`, `classes/gateways/class.pmprogateway_twocheckout.php:365`. | AST deklaracji `function cancel($$$)` nie agreguje wszystkich wariantów; kontrola `rg` ujawnia różne sygnatury. Do decyzji na etapie planowania: nie zakładać jednolitego kontraktu bez mapy kompatybilności. |
+| W repozytorium jest 16 wywołań `dbDelta()` łącznie: 15 PMPro i 1 Action Scheduler. | **potwierdzone** | PMPro: `includes/upgradecheck.php:523-807`; biblioteka: `includes/lib/action-scheduler/classes/abstracts/ActionScheduler_Abstract_Schema.php:143`. | AST `dbDelta($$$)` → 16 przy globie PHP; osobny glob `includes/upgradecheck.php` → 15. |
+| Brak test runnera/konfiguracji PHPUnit jest bezpośrednią osłoną wykonalności rankingu. | **doprecyzowane** | `package.json:4-25`; `composer.json:1-39`; workflow `.github/workflows/generate-translations.yml`. | Nie jest to twierdzenie o kodowej strukturze payment flow; sprawdzenie plików konfiguracyjnych i `rg`, nie AST. Pozostaje ograniczeniem kosztu, nie dowodem na brak jakichkolwiek testów zewnętrznych. |
+
+Weryfikacja nie zmienia sekcji `Ranking refactor opportunities` ani werdyktów intencjonalności. Wiersze o niejednolitym `cancel()` i o wielokluczowej identyfikacji wskazują ograniczenia rankingu wyłącznie jako **do decyzji na etapie planowania**.
 
 ## Ranking refactor opportunities
 
